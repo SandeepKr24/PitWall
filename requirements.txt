@@ -2,3 +2,5 @@ fastf1
 pandas
 numpy
 arcade
+supabase
+python-dotenv

@@ -3,22 +3,26 @@ FastF1 ingestion script.
 
 The (future) webpage will collect three inputs from the user:
     1) Weekend  -> dropdown, the Grand Prix name (e.g. "Bahrain",
-                   "Silverstone", "Spa"), ~30 options per season
+                   "Silverstone", "Spa"), ~30 options per season 
+                   (30 because there are rotating calendars and also pre-season testing)
     2) Year     -> text input, 4-digit integer
     3) Session  -> dropdown, options depend on the weekend's format:
                      - conventional weekends: P1, P2, P3, Q, R
                      - sprint weekends:       P1, SQ, SR, Q, R
 
 This script takes those three raw values, validates them, resolves them
-to the identifiers the FastF1 API actually expects, fetches the session
-data, and writes every data category FastF1 loads for a session (results,
-laps, weather, car telemetry, car position, track status, session status,
-race control messages, session info) out as separate CSV files so it can
-be picked up by the rest of the ingestion pipeline.
+to the identifiers the FastF1 API actually expects, and checks Supabase
+for a `sessions` row matching that (year, round, session) first - see
+supabase_store.py. If the session is already stored there, it's served
+from Supabase and FastF1 is never hit for it again. Otherwise, the data
+is fetched from FastF1, written out as CSV files locally (results, laps,
+weather, car telemetry, car position, track status, session status, race
+control messages, session info) and uploaded to Supabase.
 
 Because a single session's data (especially telemetry) can be sizeable,
-the output directory for a given request is automatically deleted
-DATA_TTL_SECONDS after ingestion so old data doesn't pile up on disk.
+the local output directory for a given request is automatically deleted
+DATA_TTL_SECONDS after ingestion - Supabase is the durable copy, the
+local CSVs are just a staging/debug artifact of a given run.
 
 There is no webpage yet, so this is runnable directly from the CLI:
     python fastF1_ingestion_script.py --year 2024 --weekend Bahrain --session R
@@ -29,9 +33,12 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import fastf1
 import pandas as pd
+
+import supabase_store
 
 # --------------------------------------------------------------------------
 # Constants mirroring the future webpage's dropdown options
@@ -209,24 +216,40 @@ SESSION_DATA_EXPORTS = (
 )
 
 
-def ingest_session(year: int, weekend_name: str, session_label: str) -> Path:
+def ingest_session(year: int, weekend_name: str, session_label: str) -> Optional[Path]:
     """
-    Validate the three UI inputs, fetch the matching FastF1 session, and
-    export every data category FastF1 loaded for it to CSV. The output
-    directory is deleted automatically after DATA_TTL_SECONDS.
+    Validate the three UI inputs and resolve them to a FastF1 event/session.
 
-    Returns the directory the CSV files were written to.
+    If that session is already stored in Supabase (checked via the
+    `sessions` table - see supabase_store.py), FastF1 is not queried for
+    its data at all and this returns None. Otherwise, the session is
+    fetched from FastF1, every data category it loaded is written to CSV
+    locally and uploaded to Supabase, and the local output directory is
+    scheduled for deletion after DATA_TTL_SECONDS (Supabase is the durable
+    copy from this point on).
+
+    Returns the local output directory, or None if the session was already
+    in Supabase and nothing needed to be fetched.
     """
     year = validate_year(year)
     weekend_name = validate_weekend_name(weekend_name)
 
     _ensure_cache_enabled()
 
+    # Resolving the event only needs the (lightweight, cached) season
+    # schedule, not a full session load, so the dedup check below is cheap
+    # even when the session turns out to already be in Supabase.
     event = get_event(year, weekend_name)
     sprint_weekend = is_sprint_weekend(event)
     session_label = validate_session_label(session_label, sprint_weekend)
-    fastf1_identifier = SESSION_ALIASES[session_label]
 
+    existing = supabase_store.find_session(year, event.RoundNumber, session_label)
+    if existing is not None:
+        print(f"{year} {event.EventName} {session_label} is already in Supabase "
+              f"(session_id={existing['id']}); skipping the FastF1 fetch.")
+        return None
+
+    fastf1_identifier = SESSION_ALIASES[session_label]
     session = event.get_session(fastf1_identifier)
     session.load()
 
@@ -241,12 +264,36 @@ def ingest_session(year: int, weekend_name: str, session_label: str) -> Path:
     # export is best-effort rather than failing the whole ingestion. Each
     # getter is only called *inside* the try block so a category that
     # failed to load doesn't blow up before we even get there.
+    data_frames = {}
     for name, get_frame in SESSION_DATA_EXPORTS:
         try:
             frame = get_frame(session)
             frame.to_csv(out_dir / f"{name}.csv", index=False)
+            data_frames[name] = frame
         except (fastf1.exceptions.DataNotLoadedError, AttributeError):
             print(f"Warning: '{name}' data was not available for this session, skipping.")
+
+    # session_info is stored in Supabase as the raw nested dict (JSONB),
+    # not the flattened one-row frame written to session_info.csv above.
+    try:
+        raw_session_info = session.session_info
+    except fastf1.exceptions.DataNotLoadedError:
+        raw_session_info = None
+
+    # The generic per-category CSV export loop above already wrote
+    # session_info.csv from the flattened frame; drop it from what gets
+    # uploaded to Supabase since it's handled separately via raw_session_info.
+    data_frames.pop("session_info", None)
+
+    session_id = supabase_store.store_session(
+        year=year,
+        round_number=event.RoundNumber,
+        event_name=event.EventName,
+        session_label=session_label,
+        data_frames=data_frames,
+        session_info=raw_session_info,
+    )
+    print(f"Stored as session_id={session_id} in Supabase.")
 
     _schedule_deletion(out_dir)
 
@@ -282,10 +329,17 @@ def main() -> None:
     except InvalidInputError as exc:
         parser.error(str(exc))
         return
+    except RuntimeError as exc:
+        parser.error(str(exc))
+        return
+
+    if out_dir is None:
+        return  # already in Supabase; ingest_session already printed why
 
     print(f"Ingested {args.year} {args.weekend_name} session "
           f"{args.session.upper()} -> {out_dir}")
-    print(f"This data will be automatically deleted in {DATA_TTL_SECONDS // 60} minutes.")
+    print(f"Local copy will be automatically deleted in {DATA_TTL_SECONDS // 60} minutes; "
+          f"the data itself now lives in Supabase.")
 
 
 if __name__ == "__main__":
