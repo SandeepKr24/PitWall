@@ -4,3 +4,6 @@ numpy
 arcade
 supabase
 python-dotenv
+anthropic
+psycopg2-binary
+sqlglot
