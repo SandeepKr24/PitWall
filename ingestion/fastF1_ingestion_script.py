@@ -1,0 +1,1 @@
+print("Hello world!")  #bas itni hi coding aati mujhe
