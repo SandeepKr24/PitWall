@@ -1,5 +1,6 @@
 .env
 venv/
+PROJECT_CONTEXT.md
 
 # Local ingestion output and caches - not meant to be committed, only Supabase is
 data/
