@@ -156,6 +156,12 @@ def _telemetry_dict_to_frame(telemetry_by_driver: dict) -> pd.DataFrame:
     car_data / pos_data are {driver_number: Telemetry DataFrame} dicts, one
     frame per driver. Flatten that into a single long DataFrame (tagged with
     a DriverNumber column) so it can be written out as one CSV.
+
+    FastF1's Telemetry frames always include a `SessionTime` column
+    alongside `Time`, but the car_data/pos_data tables only define `Time`
+    (SessionTime is redundant with it) - dropped here so the frame matches
+    the destination table's columns exactly, the same way every other
+    export category does.
     """
     if not telemetry_by_driver:
         raise fastf1.exceptions.DataNotLoadedError("no telemetry data available")
@@ -164,7 +170,7 @@ def _telemetry_dict_to_frame(telemetry_by_driver: dict) -> pd.DataFrame:
         frame = telemetry.copy()
         frame.insert(0, "DriverNumber", driver_number)
         frames.append(frame)
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(frames, ignore_index=True).drop(columns=["SessionTime"], errors="ignore")
 
 
 def _session_info_to_frame(session_info: dict) -> pd.DataFrame:

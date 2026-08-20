@@ -18,6 +18,7 @@ covered by .gitignore):
         by RLS unless you've added policies permitting these inserts)
 """
 
+import datetime
 import os
 from typing import Optional
 
@@ -66,26 +67,45 @@ def find_session(year: int, round_number: int, session_label: str) -> Optional[d
 
 def _json_safe(value):
     """
-    Make a single pandas/numpy scalar safe to send through Supabase's REST
-    API as JSON. pandas Timedelta/Timestamp, numpy int/float/bool scalars,
-    and NaN/NaT are not JSON-serializable as-is: NaN/NaT become SQL NULL,
-    Timedelta/Timestamp become strings that Postgres parses back into
-    INTERVAL/TIMESTAMP, and numpy scalars are unwrapped to native types.
+    Make a pandas/numpy/raw-Python value safe to send through Supabase's
+    REST API as JSON. pandas Timedelta/Timestamp, plain datetime/timedelta
+    (e.g. FastF1's session_info, which holds native datetime objects rather
+    than pandas ones), numpy int/float/bool scalars, and NaN/NaT are not
+    JSON-serializable as-is: NaN/NaT become SQL NULL, Timedelta/Timestamp/
+    datetime become strings that Postgres parses back into INTERVAL/
+    TIMESTAMP, and numpy scalars are unwrapped to native types. dicts and
+    lists are walked recursively, since session_info nests nested dicts
+    (e.g. "Meeting") that can themselves hold such values.
+
+    A whole-number float (e.g. 2.0) is returned as a Python int rather than
+    a float: Postgres's PostgREST insert path rejects "2.0" as input for an
+    INTEGER column (columns like race_control_messages.Sector are float64
+    in pandas only because a NaN elsewhere in the column forced the
+    upcast), while an INTEGER value is always accepted for a
+    DOUBLE PRECISION column, so this is safe for both. This has to check
+    plain `float`/`int`, not just `np.floating`/`np.integer`: DataFrame.
+    to_dict() already unwraps numpy scalars to native Python types, so by
+    the time a value reaches here it's rarely still a numpy type.
     """
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return None
     if value is pd.NaT:
         return None
-    if isinstance(value, pd.Timestamp):
+    if isinstance(value, (pd.Timestamp, datetime.datetime)):
         return value.isoformat()
-    if isinstance(value, pd.Timedelta):
+    if isinstance(value, (pd.Timedelta, datetime.timedelta)):
         return str(value)
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, np.bool_):
+    if isinstance(value, (bool, np.bool_)):
         return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        as_float = float(value)
+        return int(as_float) if as_float.is_integer() else as_float
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
     return value
 
 
@@ -138,18 +158,28 @@ def store_session(
     )
     session_id = inserted.data[0]["id"]
 
+    # Each table's upload is independently best-effort, same as the FastF1
+    # fetch step (see fastF1_ingestion_script.py) - one table failing to
+    # insert (e.g. a schema mismatch) must not prevent every other already-
+    # loaded category from being stored.
     for table_name, frame in data_frames.items():
         if frame is None or frame.empty:
             continue
         records = _records_for_insert(frame)
         for record in records:
             record["session_id"] = session_id
-        _insert_in_chunks(table_name, records)
+        try:
+            _insert_in_chunks(table_name, records)
+        except Exception as exc:
+            print(f"Warning: failed to store '{table_name}' in Supabase, skipping: {exc}")
 
     if session_info:
-        client.table("session_info").insert({
-            "session_id": session_id,
-            "info": {k: _json_safe(v) for k, v in session_info.items()},
-        }).execute()
+        try:
+            client.table("session_info").insert({
+                "session_id": session_id,
+                "info": _json_safe(session_info),
+            }).execute()
+        except Exception as exc:
+            print(f"Warning: failed to store 'session_info' in Supabase, skipping: {exc}")
 
     return session_id
