@@ -1,4 +1,5 @@
 .env
+venv/
 
 # Local ingestion output and caches - not meant to be committed, only Supabase is
 data/
