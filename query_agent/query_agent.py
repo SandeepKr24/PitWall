@@ -29,12 +29,17 @@ This script answers one such question at a time:
 Requires (in .env):
     SUPABASE_URL, SUPABASE_KEY - already used by the ingestion pipeline;
         used here only for the lightweight `sessions` lookup in step 1.
-    SUPABASE_DB_URL - a direct Postgres connection string authenticating
-        as the query_agent_ro role created by agent_access.sql, e.g.:
-        postgresql://query_agent_ro:<role-password>@<db-host>:5432/postgres
-        (find <db-host> in Supabase's Database Settings -> Connection
-        string; use query_agent_ro's own password, not the project's
-        main database password)
+    SUPABASE_DB_URL - a Postgres connection string authenticating as the
+        query_agent_ro role created by agent_access.sql, via Supabase's
+        Transaction pooler (port 6543), e.g.:
+        postgresql://query_agent_ro.<project-ref>:<role-password>@aws-0-<region>.pooler.supabase.com:6543/postgres
+        Use the Transaction pooler, not the direct connection
+        (db.<ref>.supabase.co:5432) - the direct endpoint is IPv6-only on
+        the free tier, and this script only ever uses SET LOCAL, which is
+        transaction-scoped anyway. The username needs the .<project-ref>
+        suffix so the pooler routes to the right project; use
+        query_agent_ro's own password (ALTER ROLE query_agent_ro WITH
+        PASSWORD ...), not the project's main database password.
     ANTHROPIC_API_KEY - for the Claude API calls in steps 2 and 5.
 
 There is no chat UI yet, so this is runnable directly from the CLI:
@@ -285,6 +290,15 @@ def main() -> None:
     )
     parser.add_argument("--question", type=str, required=True, help="What to ask about this session")
     args = parser.parse_args()
+
+    # Claude's answers routinely contain non-Latin-1 characters (arrows,
+    # en-dashes, etc.). On Windows the console defaults to cp1252, so a
+    # bare print() of the answer raises UnicodeEncodeError - force UTF-8
+    # output rather than depending on the terminal's code page.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
     try:
         answer = answer_question(args.year, args.weekend_name, args.session_label, args.question)
