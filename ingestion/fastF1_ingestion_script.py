@@ -27,7 +27,13 @@ local CSVs are just a staging/debug artifact of a given run.
 There is no webpage yet, so this is runnable directly from the CLI:
     python fastF1_ingestion_script.py --year 2024 --weekend Bahrain --session R
 
-Add --force to re-ingest a session that's already stored (its existing
+--weekend all / --session all fan out over a whole season / whole weekend,
+ingesting each session in turn (the dedup check skips what's already
+stored, so an interrupted batch just resumes on re-run):
+    python fastF1_ingestion_script.py --year 2024 --weekend Bahrain --session all
+    python fastF1_ingestion_script.py --year 2024 --weekend all --session R
+
+Add --force to re-ingest sessions that are already stored (each existing
 Supabase copy is deleted first, then re-fetched). To see what's already
 ingested, run list_sessions.py.
 """
@@ -51,6 +57,10 @@ import supabase_store
 # The UI-facing session labels for each weekend format.
 CONVENTIONAL_SESSIONS = ["P1", "P2", "P3", "Q", "R"]
 SPRINT_SESSIONS = ["P1", "SQ", "SR", "Q", "R"]
+
+# Passed as --weekend or --session to fan out over a whole season / whole
+# weekend instead of one session. Not a real UI value - a CLI convenience.
+BATCH_TOKEN = "all"
 
 # FastF1 does not use the same short codes as the UI (e.g. it expects
 # "FP1" instead of "P1", and calls the sprint race "S" instead of "SR"),
@@ -148,6 +158,48 @@ def get_event(year: int, weekend_name: str):
 
 def is_sprint_weekend(event) -> bool:
     return event.EventFormat != "conventional"
+
+
+def _season_weekend_names(year: int) -> list[str]:
+    """Every non-testing event name for a season, in calendar order."""
+    try:
+        schedule = fastf1.get_event_schedule(year, include_testing=False)
+    except Exception as exc:
+        raise InvalidInputError(
+            f"Could not load the {year} season schedule: {exc}"
+        ) from exc
+    names = [str(name).strip() for name in schedule["EventName"] if str(name).strip()]
+    if not names:
+        raise InvalidInputError(f"No non-testing events found for {year}.")
+    return names
+
+
+def _expand_targets(year: int, weekend_name: str, session_label: str) -> list[tuple[str, str]]:
+    """
+    Turn the (possibly 'all') weekend/session inputs into a concrete list
+    of (weekend_name, session_label) pairs to ingest.
+
+    - weekend == 'all'  -> every non-testing event that season
+    - session == 'all'  -> every session label valid for that weekend's
+                           format (conventional vs sprint)
+
+    Session labels aren't validated here - ingest_session() does that per
+    pair, so in a batch one bad combination just fails that pair.
+    """
+    weekend_all = weekend_name.strip().lower() == BATCH_TOKEN
+    session_all = session_label.strip().lower() == BATCH_TOKEN
+
+    weekend_names = _season_weekend_names(year) if weekend_all else [weekend_name.strip()]
+
+    targets: list[tuple[str, str]] = []
+    for name in weekend_names:
+        if session_all:
+            event = get_event(year, name)
+            labels = SPRINT_SESSIONS if is_sprint_weekend(event) else CONVENTIONAL_SESSIONS
+        else:
+            labels = [session_label.strip()]
+        targets.extend((name, label) for label in labels)
+    return targets
 
 
 def _slugify(name: str) -> str:
@@ -322,12 +374,82 @@ def ingest_session(
 
 
 # --------------------------------------------------------------------------
+# Orchestration - one session, or a whole weekend / season via 'all'
+# --------------------------------------------------------------------------
+
+def run_ingestion(
+    year: int,
+    weekend_name: str,
+    session_label: str,
+    force: bool = False,
+) -> int:
+    """
+    Ingest one session, or - when weekend and/or session is 'all' - fan
+    out over a whole weekend / whole season, ingesting each in turn.
+
+    A single explicit session keeps the original chatty output and lets
+    InvalidInputError / RuntimeError propagate (so the CLI can map them to
+    exit 2 / exit 1). A batch run instead reports one status line per
+    session and keeps going when one fails - the dedup check makes a
+    re-run skip whatever already landed, so an interrupted batch is just
+    resumed. A configuration/storage failure (RuntimeError) still aborts
+    the batch, since it's not a per-session problem.
+
+    Returns a process exit code: 0 if nothing failed, 1 otherwise.
+    """
+    year = validate_year(year)
+    _ensure_cache_enabled()
+
+    is_batch = BATCH_TOKEN in (weekend_name.strip().lower(), session_label.strip().lower())
+    targets = _expand_targets(year, weekend_name, session_label)
+
+    if not is_batch:
+        (only_weekend, only_session) = targets[0]
+        out_dir = ingest_session(year, only_weekend, only_session, force=force)
+        if out_dir is not None:
+            print(f"Ingested {year} {only_weekend} session {only_session.upper()} -> {out_dir}")
+            print(f"Local copy will be automatically deleted in {DATA_TTL_SECONDS // 60} "
+                  f"minutes; the data itself now lives in Supabase.")
+        return 0
+
+    # flush=True on the progress lines: a long batch is usually run with
+    # output redirected to a file, where stdout is block-buffered and these
+    # status lines would otherwise not appear until the very end (FastF1's
+    # own logging goes to stderr, so it shows up regardless).
+    print(f"Batch ingest: {len(targets)} session(s) for {year}"
+          f"{' (--force)' if force else ''}.\n", flush=True)
+    stored = skipped = failed = 0
+    for weekend, session in targets:
+        print(f"=== {year} {weekend} {session} ===", flush=True)
+        try:
+            out_dir = ingest_session(year, weekend, session, force=force)
+        except RuntimeError as exc:
+            print(f"[FAIL] {year} {weekend} {session}: {exc}", flush=True)
+            print("\nAborting batch: this looks like a configuration or storage "
+                  "problem, not a per-session one.", flush=True)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - one bad session must not stop the batch
+            failed += 1
+            print(f"[FAIL] {year} {weekend} {session}: {exc}\n", flush=True)
+            continue
+        if out_dir is None:
+            skipped += 1
+        else:
+            stored += 1
+        print(flush=True)
+
+    print(f"Batch done: {stored} stored, {skipped} already present, {failed} failed.", flush=True)
+    return 1 if failed else 0
+
+
+# --------------------------------------------------------------------------
 # CLI entry point - stands in for the webpage until it exists.
 # --------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch and ingest a single F1 session via FastF1."
+        description="Fetch and ingest F1 session data via FastF1 - one session, "
+                    "or a whole weekend / season with --weekend all / --session all."
     )
     parser.add_argument("--year", type=int, required=True, help="4-digit season year, e.g. 2024")
     parser.add_argument(
@@ -335,24 +457,28 @@ def main() -> None:
         type=str,
         required=True,
         dest="weekend_name",
-        help="Weekend/Grand Prix name, e.g. 'Bahrain', 'Silverstone', 'Spa'",
+        help="Weekend/Grand Prix name (e.g. 'Bahrain', 'Silverstone', 'Spa'), "
+             "or 'all' for every event that season",
     )
     parser.add_argument(
         "--session",
         type=str,
         required=True,
-        help="Session label: P1/P2/P3/Q/R (conventional) or P1/SQ/SR/Q/R (sprint)",
+        help="Session label: P1/P2/P3/Q/R (conventional) or P1/SQ/SR/Q/R (sprint), "
+             "or 'all' for every session that weekend",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-ingest even if this session is already in Supabase "
+        help="Re-ingest even if a session is already in Supabase "
              "(deletes the existing copy first, then re-fetches from FastF1).",
     )
     args = parser.parse_args()
 
     try:
-        out_dir = ingest_session(args.year, args.weekend_name, args.session, force=args.force)
+        exit_code = run_ingestion(
+            args.year, args.weekend_name, args.session, force=args.force
+        )
     except InvalidInputError as exc:
         # A bad CLI value - show usage alongside the message.
         parser.error(str(exc))
@@ -364,13 +490,7 @@ def main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if out_dir is None:
-        return  # already in Supabase; ingest_session already printed why
-
-    print(f"Ingested {args.year} {args.weekend_name} session "
-          f"{args.session.upper()} -> {out_dir}")
-    print(f"Local copy will be automatically deleted in {DATA_TTL_SECONDS // 60} minutes; "
-          f"the data itself now lives in Supabase.")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
