@@ -80,6 +80,12 @@ ALLOWED_TABLES = {
 # independent of whether the SQL itself looks reasonable.
 QUERY_TIMEOUT_MS = 10_000
 
+# Cap on how many result rows are handed to Claude for the final answer.
+# A broad query ("every lap for every driver") can return thousands of
+# rows, which blows the model's context/token budget and balloons cost.
+# The answer step gets the first N with a note that the rest were dropped.
+MAX_ROWS_TO_CLAUDE = 500
+
 
 class QueryAgentError(Exception):
     """Raised for any agent-specific failure (bad SQL, missing session, etc.)."""
@@ -92,7 +98,14 @@ def _db_connection():
             "SUPABASE_DB_URL must be set (see this script's module docstring) "
             "to run queries."
         )
-    return psycopg2.connect(db_url)
+    try:
+        return psycopg2.connect(db_url)
+    except psycopg2.OperationalError as exc:
+        raise QueryAgentError(
+            "Could not connect to the database via SUPABASE_DB_URL. Check the "
+            "host/port (Transaction pooler, :6543), the query_agent_ro "
+            f"username/password, and network egress.\nUnderlying error: {exc}"
+        ) from exc
 
 
 def describe_schema(conn) -> str:
@@ -133,9 +146,28 @@ def _extract_text(response) -> str:
     raise QueryAgentError("Claude's response contained no text block.")
 
 
+def _claude_text(**create_kwargs) -> str:
+    """
+    Run one Claude Messages call and return its text, turning the Anthropic
+    SDK's exceptions into QueryAgentError so the CLI reports them cleanly
+    instead of dumping a traceback. Covers a missing/invalid API key
+    (AuthenticationError) and everything else the SDK raises - connection
+    errors, rate limits, 5xxs (all AnthropicError subclasses).
+    """
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(**create_kwargs)
+    except anthropic.AuthenticationError as exc:
+        raise QueryAgentError(
+            f"Anthropic rejected ANTHROPIC_API_KEY (see .env): {exc}"
+        ) from exc
+    except anthropic.AnthropicError as exc:
+        raise QueryAgentError(f"Anthropic API call failed: {exc}") from exc
+    return _extract_text(response)
+
+
 def generate_sql(question: str, schema_description: str) -> str:
-    client = anthropic.Anthropic()
-    response = client.messages.create(
+    text = _claude_text(
         model=CLAUDE_MODEL,
         max_tokens=1024,
         system=(
@@ -155,7 +187,7 @@ def generate_sql(question: str, schema_description: str) -> str:
         ),
         messages=[{"role": "user", "content": question}],
     )
-    return _strip_code_fence(_extract_text(response).strip())
+    return _strip_code_fence(text.strip())
 
 
 def _strip_code_fence(text: str) -> str:
@@ -206,19 +238,39 @@ def validate_select_only(sql: str) -> str:
 
 
 def run_query(conn, session_id: int, sql: str) -> list[dict]:
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SET LOCAL statement_timeout = %s", (QUERY_TIMEOUT_MS,))
-        # Scopes every RLS-covered table to this one session, regardless of
-        # whether/how `sql` itself filters by session_id - see agent_access.sql.
-        cur.execute("SET LOCAL app.session_id = %s", (str(session_id),))
-        cur.execute(sql)
-        rows = cur.fetchall()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET LOCAL statement_timeout = %s", (QUERY_TIMEOUT_MS,))
+            # Scopes every RLS-covered table to this one session, regardless of
+            # whether/how `sql` itself filters by session_id - see agent_access.sql.
+            cur.execute("SET LOCAL app.session_id = %s", (str(session_id),))
+            cur.execute(sql)
+            rows = cur.fetchall()
+    except psycopg2.errors.QueryCanceled as exc:
+        conn.rollback()
+        raise QueryAgentError(
+            f"The generated query hit the {QUERY_TIMEOUT_MS} ms timeout and was "
+            f"cancelled - it was too expensive to run.\nSQL:\n{sql}"
+        ) from exc
+    except psycopg2.Error as exc:
+        conn.rollback()
+        raise QueryAgentError(
+            f"The generated SQL failed to execute against Postgres: "
+            f"{str(exc).strip()}\nSQL:\n{sql}"
+        ) from exc
     return [dict(row) for row in rows]
 
 
 def synthesize_answer(question: str, sql: str, rows: list[dict]) -> str:
-    client = anthropic.Anthropic()
-    response = client.messages.create(
+    shown = rows[:MAX_ROWS_TO_CLAUDE]
+    truncation_note = ""
+    if len(rows) > MAX_ROWS_TO_CLAUDE:
+        truncation_note = (
+            f"\n\nNOTE: the query returned {len(rows)} rows; only the first "
+            f"{MAX_ROWS_TO_CLAUDE} are included above. If that makes the answer "
+            f"incomplete, say so and suggest a narrower question."
+        )
+    return _claude_text(
         model=CLAUDE_MODEL,
         max_tokens=2048,
         system=(
@@ -234,11 +286,10 @@ def synthesize_answer(question: str, sql: str, rows: list[dict]) -> str:
             "content": (
                 f"Question: {question}\n\n"
                 f"SQL that was run: {sql}\n\n"
-                f"Results ({len(rows)} rows): {rows}"
+                f"Results ({len(rows)} rows): {shown}{truncation_note}"
             ),
         }],
     )
-    return _extract_text(response)
 
 
 def answer_question(year: int, weekend_name: str, session_label: str, question: str) -> str:
@@ -302,9 +353,17 @@ def main() -> None:
 
     try:
         answer = answer_question(args.year, args.weekend_name, args.session_label, args.question)
-    except (ingestion.InvalidInputError, QueryAgentError) as exc:
+    except ingestion.InvalidInputError as exc:
+        # A bad CLI value - show usage alongside the message.
         parser.error(str(exc))
         return
+    except (QueryAgentError, RuntimeError) as exc:
+        # A resolution/DB/API failure (missing env vars, bad connection
+        # string, rejected key, un-ingested session, un-runnable SQL). The
+        # args were fine, so usage text would just be noise. RuntimeError
+        # covers supabase_store.get_client()'s missing-env-var error.
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(answer)
 

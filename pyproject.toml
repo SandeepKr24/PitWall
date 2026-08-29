@@ -1,0 +1,20 @@
+# Pytest configuration only - the project installs its runtime deps from
+# requirements.txt (unpinned for now) and its test-only deps from
+# requirements-dev.txt. There's deliberately no [project] table yet;
+# "Pits" isn't packaged/distributed, it's run as scripts.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The two script dirs aren't a package, so make their modules importable
+# by bare name (import supabase_store / fastF1_ingestion_script / query_agent)
+# the same way the scripts import each other at runtime.
+pythonpath = ["ingestion", "query_agent"]
+addopts = "-ra"
+filterwarnings = [
+    # pandas 2.3.x emits this on every Timedelta construction when run
+    # against numpy >= 2.5 (the versions requirements.txt currently
+    # resolves to). It's a library-version mismatch, not our code - drop
+    # it once requirements.txt is pinned to a compatible pair (see the
+    # "Small extras" item in PROJECT_CONTEXT.md's Next steps).
+    "ignore:The 'generic' unit for NumPy timedelta is deprecated:DeprecationWarning",
+]

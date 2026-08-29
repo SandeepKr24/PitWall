@@ -26,6 +26,10 @@ local CSVs are just a staging/debug artifact of a given run.
 
 There is no webpage yet, so this is runnable directly from the CLI:
     python fastF1_ingestion_script.py --year 2024 --weekend Bahrain --session R
+
+Add --force to re-ingest a session that's already stored (its existing
+Supabase copy is deleted first, then re-fetched). To see what's already
+ingested, run list_sessions.py.
 """
 
 import argparse
@@ -222,20 +226,26 @@ SESSION_DATA_EXPORTS = (
 )
 
 
-def ingest_session(year: int, weekend_name: str, session_label: str) -> Optional[Path]:
+def ingest_session(
+    year: int,
+    weekend_name: str,
+    session_label: str,
+    force: bool = False,
+) -> Optional[Path]:
     """
     Validate the three UI inputs and resolve them to a FastF1 event/session.
 
     If that session is already stored in Supabase (checked via the
     `sessions` table - see supabase_store.py), FastF1 is not queried for
-    its data at all and this returns None. Otherwise, the session is
-    fetched from FastF1, every data category it loaded is written to CSV
-    locally and uploaded to Supabase, and the local output directory is
-    scheduled for deletion after DATA_TTL_SECONDS (Supabase is the durable
-    copy from this point on).
+    its data at all and this returns None - unless `force` is set, in which
+    case the existing copy is deleted and the session is re-fetched from
+    scratch. Otherwise, the session is fetched from FastF1, every data
+    category it loaded is written to CSV locally and uploaded to Supabase,
+    and the local output directory is scheduled for deletion after
+    DATA_TTL_SECONDS (Supabase is the durable copy from this point on).
 
     Returns the local output directory, or None if the session was already
-    in Supabase and nothing needed to be fetched.
+    in Supabase and `force` was not set.
     """
     year = validate_year(year)
     weekend_name = validate_weekend_name(weekend_name)
@@ -251,9 +261,14 @@ def ingest_session(year: int, weekend_name: str, session_label: str) -> Optional
 
     existing = supabase_store.find_session(year, event.RoundNumber, session_label)
     if existing is not None:
+        if not force:
+            print(f"{year} {event.EventName} {session_label} is already in Supabase "
+                  f"(session_id={existing['id']}); skipping the FastF1 fetch. "
+                  f"Pass --force to re-ingest it.")
+            return None
         print(f"{year} {event.EventName} {session_label} is already in Supabase "
-              f"(session_id={existing['id']}); skipping the FastF1 fetch.")
-        return None
+              f"(session_id={existing['id']}); --force set, deleting it and re-ingesting.")
+        supabase_store.delete_session(existing["id"])
 
     fastf1_identifier = SESSION_ALIASES[session_label]
     session = event.get_session(fastf1_identifier)
@@ -328,16 +343,26 @@ def main() -> None:
         required=True,
         help="Session label: P1/P2/P3/Q/R (conventional) or P1/SQ/SR/Q/R (sprint)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-ingest even if this session is already in Supabase "
+             "(deletes the existing copy first, then re-fetches from FastF1).",
+    )
     args = parser.parse_args()
 
     try:
-        out_dir = ingest_session(args.year, args.weekend_name, args.session)
+        out_dir = ingest_session(args.year, args.weekend_name, args.session, force=args.force)
     except InvalidInputError as exc:
+        # A bad CLI value - show usage alongside the message.
         parser.error(str(exc))
         return
     except RuntimeError as exc:
-        parser.error(str(exc))
-        return
+        # A runtime/config/storage failure (missing env vars, a rolled-back
+        # partial upload, etc.) - the args were fine, so usage text would
+        # just be noise. supabase_store.SupabaseStoreError lands here too.
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if out_dir is None:
         return  # already in Supabase; ingest_session already printed why
