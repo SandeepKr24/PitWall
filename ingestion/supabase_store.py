@@ -19,6 +19,7 @@ covered by .gitignore):
 """
 
 import datetime
+import logging
 import os
 from typing import Optional
 
@@ -28,6 +29,11 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 load_dotenv()
+
+# Library module: log through the standard hierarchy and let the entry
+# point (fastF1_ingestion_script.main / query_agent.main) decide handlers
+# and level. No basicConfig / print here.
+logger = logging.getLogger(__name__)
 
 # Inserting thousands of telemetry rows in a single request risks hitting
 # request size/timeout limits, so large frames are sent in chunks instead.
@@ -203,12 +209,16 @@ def _rollback_session(session_id: int, failed_on: str) -> None:
     """
     try:
         delete_session(session_id)
-        print(f"Rolled back session_id={session_id} after '{failed_on}' failed to store.")
+        logger.warning(
+            "Rolled back session_id=%s after '%s' failed to store.",
+            session_id, failed_on,
+        )
     except Exception as exc:
-        print(
-            f"WARNING: '{failed_on}' failed to store AND the partial "
-            f"session_id={session_id} could not be rolled back ({exc}). "
-            f"Delete that `sessions` row manually before re-ingesting."
+        logger.error(
+            "'%s' failed to store AND the partial session_id=%s could not be "
+            "rolled back (%s). Delete that `sessions` row manually before "
+            "re-ingesting.",
+            failed_on, session_id, exc,
         )
 
 

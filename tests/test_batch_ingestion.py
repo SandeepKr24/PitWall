@@ -127,7 +127,7 @@ def test_run_ingestion_single_propagates_invalid_input(monkeypatch):
         ing.run_ingestion(2024, "Bahrain", "ZZ")
 
 
-def test_run_ingestion_batch_tallies_stored_skipped_failed(monkeypatch, capsys):
+def test_run_ingestion_batch_tallies_stored_skipped_failed(monkeypatch, caplog):
     monkeypatch.setattr(
         ing, "_expand_targets",
         lambda year, weekend, session: [("A", "R"), ("B", "R"), ("C", "R"), ("D", "R")],
@@ -144,11 +144,12 @@ def test_run_ingestion_batch_tallies_stored_skipped_failed(monkeypatch, capsys):
 
     monkeypatch.setattr(ing, "ingest_session", fake_ingest)
 
-    code = ing.run_ingestion(2024, "all", "R", force=True)
+    with caplog.at_level("INFO", logger=ing.logger.name):
+        code = ing.run_ingestion(2024, "all", "R", force=True)
 
     assert code == 1  # a session failed
-    summary = capsys.readouterr().out
-    assert "2 stored, 1 already present, 1 failed" in summary
+    assert "Batch done: 2 stored, 1 already present, 1 failed." in caplog.text
+    assert "[FAIL] 2024 C R: no data for this session yet" in caplog.text
 
 
 def test_run_ingestion_batch_all_ok_returns_zero(monkeypatch):

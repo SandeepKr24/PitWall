@@ -39,6 +39,7 @@ ingested, run list_sessions.py.
 """
 
 import argparse
+import logging
 import re
 import subprocess
 import sys
@@ -49,6 +50,8 @@ import fastf1
 import pandas as pd
 
 import supabase_store
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Constants mirroring the future webpage's dropdown options
@@ -314,12 +317,17 @@ def ingest_session(
     existing = supabase_store.find_session(year, event.RoundNumber, session_label)
     if existing is not None:
         if not force:
-            print(f"{year} {event.EventName} {session_label} is already in Supabase "
-                  f"(session_id={existing['id']}); skipping the FastF1 fetch. "
-                  f"Pass --force to re-ingest it.")
+            logger.info(
+                "%s %s %s is already in Supabase (session_id=%s); skipping the "
+                "FastF1 fetch. Pass --force to re-ingest it.",
+                year, event.EventName, session_label, existing["id"],
+            )
             return None
-        print(f"{year} {event.EventName} {session_label} is already in Supabase "
-              f"(session_id={existing['id']}); --force set, deleting it and re-ingesting.")
+        logger.info(
+            "%s %s %s is already in Supabase (session_id=%s); --force set, "
+            "deleting it and re-ingesting.",
+            year, event.EventName, session_label, existing["id"],
+        )
         supabase_store.delete_session(existing["id"])
 
     fastf1_identifier = SESSION_ALIASES[session_label]
@@ -344,7 +352,7 @@ def ingest_session(
             frame.to_csv(out_dir / f"{name}.csv", index=False)
             data_frames[name] = frame
         except (fastf1.exceptions.DataNotLoadedError, AttributeError):
-            print(f"Warning: '{name}' data was not available for this session, skipping.")
+            logger.warning("'%s' data was not available for this session, skipping.", name)
 
     # session_info is stored in Supabase as the raw nested dict (JSONB),
     # not the flattened one-row frame written to session_info.csv above.
@@ -366,7 +374,7 @@ def ingest_session(
         data_frames=data_frames,
         session_info=raw_session_info,
     )
-    print(f"Stored as session_id={session_id} in Supabase.")
+    logger.info("Stored as session_id=%s in Supabase.", session_id)
 
     _schedule_deletion(out_dir)
 
@@ -407,38 +415,45 @@ def run_ingestion(
         (only_weekend, only_session) = targets[0]
         out_dir = ingest_session(year, only_weekend, only_session, force=force)
         if out_dir is not None:
-            print(f"Ingested {year} {only_weekend} session {only_session.upper()} -> {out_dir}")
-            print(f"Local copy will be automatically deleted in {DATA_TTL_SECONDS // 60} "
-                  f"minutes; the data itself now lives in Supabase.")
+            logger.info(
+                "Ingested %s %s session %s -> %s",
+                year, only_weekend, only_session.upper(), out_dir,
+            )
+            logger.info(
+                "Local copy will be automatically deleted in %s minutes; the "
+                "data itself now lives in Supabase.", DATA_TTL_SECONDS // 60,
+            )
         return 0
 
-    # flush=True on the progress lines: a long batch is usually run with
-    # output redirected to a file, where stdout is block-buffered and these
-    # status lines would otherwise not appear until the very end (FastF1's
-    # own logging goes to stderr, so it shows up regardless).
-    print(f"Batch ingest: {len(targets)} session(s) for {year}"
-          f"{' (--force)' if force else ''}.\n", flush=True)
+    logger.info(
+        "Batch ingest: %s session(s) for %s%s.",
+        len(targets), year, " (--force)" if force else "",
+    )
     stored = skipped = failed = 0
     for weekend, session in targets:
-        print(f"=== {year} {weekend} {session} ===", flush=True)
+        logger.info("=== %s %s %s ===", year, weekend, session)
         try:
             out_dir = ingest_session(year, weekend, session, force=force)
         except RuntimeError as exc:
-            print(f"[FAIL] {year} {weekend} {session}: {exc}", flush=True)
-            print("\nAborting batch: this looks like a configuration or storage "
-                  "problem, not a per-session one.", flush=True)
+            logger.error("[FAIL] %s %s %s: %s", year, weekend, session, exc)
+            logger.error(
+                "Aborting batch: this looks like a configuration or storage "
+                "problem, not a per-session one."
+            )
             return 1
         except Exception as exc:  # noqa: BLE001 - one bad session must not stop the batch
             failed += 1
-            print(f"[FAIL] {year} {weekend} {session}: {exc}\n", flush=True)
+            logger.error("[FAIL] %s %s %s: %s", year, weekend, session, exc)
             continue
         if out_dir is None:
             skipped += 1
         else:
             stored += 1
-        print(flush=True)
 
-    print(f"Batch done: {stored} stored, {skipped} already present, {failed} failed.", flush=True)
+    logger.info(
+        "Batch done: %s stored, %s already present, %s failed.",
+        stored, skipped, failed,
+    )
     return 1 if failed else 0
 
 
@@ -475,6 +490,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # This module's own progress/warnings (and supabase_store's) go through
+    # logging; message-only format so it reads like plain output. Root stays
+    # at WARNING so third-party INFO chatter (httpx logging every Supabase
+    # request URL, etc.) is suppressed - only our two loggers are boosted to
+    # INFO. FastF1 configures its own `fastf1` logger separately.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logger.setLevel(logging.INFO)
+    logging.getLogger("supabase_store").setLevel(logging.INFO)
+
     try:
         exit_code = run_ingestion(
             args.year, args.weekend_name, args.session, force=args.force
@@ -487,7 +511,7 @@ def main() -> None:
         # A runtime/config/storage failure (missing env vars, a rolled-back
         # partial upload, etc.) - the args were fine, so usage text would
         # just be noise. supabase_store.SupabaseStoreError lands here too.
-        print(f"Error: {exc}", file=sys.stderr)
+        logger.error("Error: %s", exc)
         sys.exit(1)
 
     sys.exit(exit_code)

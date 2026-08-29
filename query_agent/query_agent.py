@@ -48,6 +48,7 @@ There is no chat UI yet, so this is runnable directly from the CLI:
 """
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -68,6 +69,8 @@ import fastF1_ingestion_script as ingestion  # noqa: E402
 import supabase_store  # noqa: E402
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL = "claude-sonnet-5"
 
@@ -342,6 +345,12 @@ def main() -> None:
     parser.add_argument("--question", type=str, required=True, help="What to ask about this session")
     args = parser.parse_args()
 
+    # Diagnostics go through logging (to stderr); the answer itself is
+    # printed to stdout, so `... > answer.md` still captures just the answer.
+    # WARNING at the root keeps third-party INFO chatter (httpx logging each
+    # request URL, etc.) out of the output - this module only logs errors.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+
     # Claude's answers routinely contain non-Latin-1 characters (arrows,
     # en-dashes, etc.). On Windows the console defaults to cp1252, so a
     # bare print() of the answer raises UnicodeEncodeError - force UTF-8
@@ -362,7 +371,7 @@ def main() -> None:
         # string, rejected key, un-ingested session, un-runnable SQL). The
         # args were fine, so usage text would just be noise. RuntimeError
         # covers supabase_store.get_client()'s missing-env-var error.
-        print(f"Error: {exc}", file=sys.stderr)
+        logger.error("Error: %s", exc)
         sys.exit(1)
 
     print(answer)

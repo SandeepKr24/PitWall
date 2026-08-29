@@ -1,9 +1,18 @@
-fastf1
-pandas
-numpy
-arcade
-supabase
-python-dotenv
-anthropic
-psycopg2-binary
-sqlglot
+# Direct dependencies, pinned to the versions currently in use. Transitive
+# deps float (no lockfile tooling here) - if that ever bites, move to
+# pip-tools / uv. To refresh a pin: bump it here, reinstall, run the tests.
+
+fastf1==3.8.3
+pandas==2.3.3
+# numpy held < 2.5: 2.5.x deprecates the timedelta unit handling pandas
+# 2.3.x relies on, which spams a DeprecationWarning on every pd.Timedelta.
+numpy==2.4.6
+supabase==2.31.0
+python-dotenv==1.2.3
+anthropic==1.1.0
+psycopg2-binary==2.9.12
+sqlglot==30.17.0
+
+# arcade - not used yet (was earmarked for a possible GUI). Re-add when/if
+# that's decided; nothing in the codebase imports it.
+# arcade
