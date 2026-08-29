@@ -1,4 +1,4 @@
-# Pits
+# PitWall
 
 **An AI-powered Formula 1 analyst.** Pick a Grand Prix weekend, year, and session,
 ingest that session's data, then ask questions about it in plain English —
