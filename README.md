@@ -16,11 +16,11 @@ FastF1 API ─▶ ingestion/fastF1_ingestion_script.py ─▶ Supabase (PostgreS
                      Anthropic Claude  ─▶  answer (table / prose / both)
 ```
 
-1. **Ingest** — resolve the weekend/year/session, pull nine data categories from
+1. **Ingest**: resolve the weekend/year/session, pull nine data categories from
    [FastF1](https://docs.fastf1.dev/) (results, laps, weather, car telemetry, car
    position, track status, session status, race-control messages, session info),
    and store them in Supabase. Already-ingested sessions are detected and skipped.
-2. **Query** — Claude writes a single read-only SQL `SELECT` for the question
+2. **Query**: Claude writes a single read-only SQL `SELECT` for the question
    against the live schema; it is AST-validated, then executed as a
    `SELECT` only Postgres role scoped to that one session; Claude turns the rows
    into the final answer.
