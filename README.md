@@ -1,9 +1,9 @@
 # PitWall
 
 **An AI-powered Formula 1 analyst.** Pick a Grand Prix weekend, year, and session,
-ingest that session's data, then ask questions about it in plain English —
+ingest that session's data, then ask questions about it in plain English:
 "What were the results of this race?", "Compare Verstappen and Hamilton lap by
-lap." — and get answers grounded in the real data.
+lap." and get answers grounded in the real data.
 
 ## How it works
 
@@ -22,10 +22,10 @@ FastF1 API ─▶ ingestion/fastF1_ingestion_script.py ─▶ Supabase (PostgreS
    and store them in Supabase. Already-ingested sessions are detected and skipped.
 2. **Query** — Claude writes a single read-only SQL `SELECT` for the question
    against the live schema; it is AST-validated, then executed as a
-   `SELECT`-only Postgres role scoped to that one session; Claude turns the rows
+   `SELECT` only Postgres role scoped to that one session; Claude turns the rows
    into the final answer.
 
-There is **no web UI yet** — the two scripts below stand in for it (see
+There is **no web UI yet**, the two scripts below stand in for it (see
 [Roadmap](#roadmap)).
 
 ## Requirements
@@ -97,11 +97,11 @@ The answer is printed to stdout; progress and errors go to stderr.
 
 The SQL Claude generates is treated as untrusted input. Three independent layers:
 
-1. **AST validation** (`sqlglot`) — exactly one statement, `SELECT`/`UNION` only,
+1. **AST validation** (`sqlglot`): exactly one statement, `SELECT`/`UNION` only,
    only known tables.
-2. **`query_agent_ro` role** — `SELECT`-only grants, not a table owner, so it
+2. **`query_agent_ro` role**: `SELECT`-only grants, not a table owner, so it
    structurally cannot write or run DDL.
-3. **Row-Level Security** — every per-session table is filtered to the one
+3. **Row-Level Security**: every per-session table is filtered to the one
    `session_id` the user selected, enforced by Postgres, plus a 10-second
    statement timeout.
 
@@ -112,7 +112,7 @@ venv/Scripts/python -m pip install -r requirements-dev.txt
 venv/Scripts/python -m pytest
 ```
 
-80 tests, all offline (no network, no live database — the Supabase client and
+80 tests, all offline (no network, no live database, the Supabase client and
 Anthropic SDK are mocked).
 
 ## Project layout
@@ -134,11 +134,11 @@ requirements-dev.txt           # + pytest
 
 The end goal is a deployed web app:
 
-- **Input screen** — dropdowns for weekend and session, a text field for the
+- **Input screen**: dropdowns for weekend and session, a text field for the
   year, session options adapting to the weekend format (conventional vs sprint).
-- **Chat interface** — after submitting, land on a chat screen and ask anything
+- **Chat interface**: after submitting, land on a chat screen and ask anything
   about that session; the current `query_agent` becomes the backend.
-- **Deployment** — host the web frontend and an HTTP API in front of the existing
+- **Deployment**: host the web frontend and an HTTP API in front of the existing
   ingestion and query modules.
 
 Stack for the web layer is not yet decided.
